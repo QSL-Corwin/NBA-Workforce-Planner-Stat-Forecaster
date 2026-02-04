@@ -1,0 +1,865 @@
+import requests  
+import pandas as pd  
+import numpy as np  
+from datetime import datetime  
+import time  
+from typing import List, Dict, Any, Optional  
+import concurrent.futures  
+import gspread  
+from gspread\_dataframe import set\_with\_dataframe  
+\# Add these for Colab auth  
+from google.colab import auth  
+from google.auth import default  
+\# \==========================================  
+\# CONFIGURATION & AUTHENTICATION  
+\# \==========================================  
+\# NOTE: Replace with your actual GOAT Tier API Key  
+API\_KEY \= ""  
+BASE\_URL \= "https://api.balldontlie.io/v1"  
+HEADERS \= {"Authorization": API\_KEY}  
+\# Workforce Management Settings  
+TEAM\_CAPACITY\_MINUTES \= 240.0 \# Strict Regulation Capacity (48 mins \* 5 positions)  
+MAX\_ROSTER\_SIZE \= 15 \# STRICT CUT: Top 15 players by minutes only  
+MIN\_SAMPLE\_SIZE \= 5 \# Minimum games to establish a baseline  
+MIN\_TEAM\_PROJECTION \= 190.0 \# Safety floor: Don't normalize if we found \< 190 raw mins  
+MAX\_WORKERS \= 10 \# Thread count  
+\# NEW: Specific League Averages for 2025 (Estimated Base)  
+LEAGUE\_AVGS \= {  
+    'pts': 114.5,  
+    'reb': 44.0,  
+    'ast': 26.5,  
+    'stl': 7.5,  
+    'blk': 5.0,  
+    'fg3m': 13.0  
+}  
+\# NEW: League average pace  
+LEAGUE\_AVG\_PACE \= 100.0  
+\# Waterfall Weights & Windows (The Core Forecasting Logic)  
+WATERFALL\_CONFIG \= {  
+    'season': {'weight': 0.05, 'limit': 100}, \# Baseline Capability  
+    'last\_32': {'weight': 0.15, 'limit': 32}, \# Quarterly Trend  
+    'last\_16': {'weight': 0.20, 'limit': 16}, \# Monthly Trend  
+    'last\_8': {'weight': 0.30, 'limit': 8}, \# Bi-Weekly Trend  
+    'last\_4': {'weight': 0.35, 'limit': 4} \# Current Rotation  
+}  
+\# Standard Rotation Curves (Interval Distribution)  
+ROTATION\_CURVES \= {  
+    "STARTER": \[0.34, 0.16, 0.32, 0.18\],  
+    "ROTATION": \[0.15, 0.35, 0.15, 0.35\],  
+    "BENCH": \[0.10, 0.40, 0.10, 0.40\]  
+}  
+\# Categories to Forecast  
+STAT\_CATEGORIES \= \['pts', 'ast', 'reb', 'stl', 'blk', 'fg3m'\]  
+\# Current season for 2025-26 (January 2026\) \- Change to 2024 for testing if API has no 2025 data  
+CURRENT\_SEASON \= 2025 \# Set to 2024 for validation with real historical data  
+\# NEW: Category-specific MAE from audits (for Pick6 confidence buffers)  
+CATEGORY\_MAE \= {  
+    'PTS': 4.5, \# Moderate accuracy (65%)  
+    'AST': 1.67, \# High accuracy (73%)  
+    'REB': 2.0, \# High accuracy (\~70%)  
+    'FG3M': 1.2, \# High accuracy (\~70%)  
+    'STL': 0.8, \# Lower accuracy (\~55%), tighter buffer to fade  
+    'BLK': 0.7, \# Lower accuracy (\~55%)  
+    'PRA': 7.33, \# Volatile (50%)  
+    'PA': 5.0, \# Estimated based on components  
+    'PR': 5.5, \# Estimated  
+    'RA': 3.5, \# Estimated  
+    'DKFP': 10.0 \# High variance, but no line so skipped  
+}  
+\# \==========================================  
+\# CLASS: WORKFORCE ANALYTICS ENGINE  
+\# \==========================================  
+class NBAWorkforcePlanner:  
+    def \_\_init\_\_(self, api\_key: str):  
+        self.headers \= {"Authorization": api\_key}  
+        self.player\_logs\_cache: Dict\[int, pd.DataFrame\] \= {}  
+        self.session \= requests.Session()  
+        self.session.headers.update(self.headers)  
+        self.request\_count \= 0  
+        \# Cache key: (player\_id, stat\_type\_UPPERCASE) \-\> line value  
+        self.betting\_lines\_cache: Dict\[tuple, float\] \= {}  
+    def \_get\_full\_response(self, endpoint: str, params: Optional\[Dict\] \= None) \-\> Dict:  
+        """Returns full JSON response (including meta for pagination)."""  
+        self.request\_count \+= 1  
+        url \= endpoint if endpoint.startswith("http") else f"{BASE\_URL}/{endpoint}"
+
+        for attempt in range(3):  
+            try:  
+                resp \= self.session.get(url, params=params)  
+                if resp.status\_code \== 429:  
+                    sleep\_time \= 2 \*\* attempt  
+                    print(f" \[429\] Rate limit hit. Sleeping {sleep\_time}s...")  
+                    time.sleep(sleep\_time)  
+                    continue  
+                resp.raise\_for\_status()  
+                return resp.json()  
+            except requests.exceptions.RequestException as e:  
+                print(f"API Error \[{endpoint}\]: {e}")  
+                return {"data": \[\], "meta": {}}  
+        return {"data": \[\], "meta": {}}  
+    def \_get\_data(self, endpoint: str, params: Optional\[Dict\] \= None) \-\> List\[Dict\]:  
+        """Convenience for just data."""  
+        return self.\_get\_full\_response(endpoint, params).get("data", \[\])  
+    def get\_games\_today(self, date\_str: Optional\[str\] \= None) \-\> pd.DataFrame:  
+        if not date\_str:  
+            date\_str \= datetime.now().strftime('%Y-%m-%d')  
+        print(f"--- Fetching Schedule for {date\_str} \---")  
+        games \= self.\_get\_data("games", {"dates\[\]": date\_str})  
+        return pd.DataFrame(games)  
+    def get\_team\_injuries(self, team\_id: int) \-\> set:  
+        """  
+        Fetches current injuries for a team and returns a set of player IDs marked as 'Out'.  
+        Like checking the pre-game injury list to avoid projecting unavailable players.  
+        """  
+        print(f" \[DEBUG\] Fetching injuries for team {team\_id}")  
+        params \= {"team\_ids\[\]": team\_id}  
+        injuries \= self.\_get\_data("player\_injuries", params)
+
+        out\_players \= set()  
+        for injury in injuries:  
+            if injury.get('status') \== 'Out': \# Assuming 'status' field; confirm via API test if needed  
+                player \= injury.get('player', {})  
+                pid \= player.get('id')  
+                if pid:  
+                    out\_players.add(pid)  
+                    print(f" \[INJURY\] Excluding {player.get('first\_name', '')} {player.get('last\_name', '')} (Out: {injury.get('comment', 'N/A')})")
+
+        return out\_players  
+    def get\_active\_rotation(self, team\_id: int) \-\> List\[Dict\]:  
+        params \= {"team\_ids\[\]": team\_id, "seasons\[\]": CURRENT\_SEASON, "per\_page": 20, "status": "Final"}  
+        games\_data \= self.\_get\_data("games", params)  
+        game\_ids \= \[g\['id'\] for g in games\_data\]  
+        if not game\_ids:  
+            print(f" \[DEBUG\] No recent games found for team {team\_id}")  
+            return \[\]  
+        all\_stats \= \[\]  
+        cursor \= None  
+        while True:  
+            params \= {"game\_ids\[\]": game\_ids, "per\_page": 100}  
+            if cursor:  
+                params\['cursor'\] \= cursor  
+            payload \= self.\_get\_full\_response("stats", params)  
+            data \= payload.get("data", \[\])  
+            all\_stats.extend(data)  
+            meta \= payload.get("meta", {})  
+            cursor \= meta.get("next\_cursor")  
+            if not cursor or not data:  
+                break  
+        print(f" \[DEBUG\] Fetched {len(all\_stats)} stats rows from {len(game\_ids)} recent games for team {team\_id}")  
+        player\_minutes, player\_info \= {}, {}  
+        for row in all\_stats:  
+            row\_team \= row.get('team')  
+            if not row\_team or row\_team.get('id') \!= team\_id:  
+                continue  
+            p \= row.get('player')  
+            if not p:  
+                continue  
+            pid \= p\['id'\]  
+            min\_str \= str(row.get('min', '0'))  
+            min\_val \= 0.0  
+            try:  
+                if ':' in min\_str:  
+                    parts \= min\_str.split(':')  
+                    min\_val \= int(parts\[0\]) \+ int(parts\[1\]) / 60  
+                else:  
+                    min\_val \= float(min\_str)  
+            except:  
+                min\_val \= 0.0  
+            if min\_val \> 0:  
+                player\_minutes\[pid\] \= player\_minutes.get(pid, 0.0) \+ min\_val  
+                player\_info\[pid\] \= p  
+        sorted\_pids \= sorted(player\_minutes, key=player\_minutes.get, reverse=True)\[:MAX\_ROSTER\_SIZE\]  
+        roster \= \[player\_info\[pid\] for pid in sorted\_pids\]  
+        print(f" \[DEBUG\] Pre-injury active roster size: {len(roster)}")
+
+        \# NEW: Fetch injuries and filter out 'Out' players  
+        injured\_pids \= self.get\_team\_injuries(team\_id)  
+        filtered\_roster \= \[p for p in roster if p\['id'\] not in injured\_pids\]
+
+        print(f" \[DEBUG\] Post-injury active roster size: {len(filtered\_roster)}")  
+        return filtered\_roster  
+    def generate\_dynamic\_opponent\_factors(self, team\_ids: List\[int\]) \-\> Dict\[str, Dict\[str, float\]\]:  
+        print(f"\\n--- Generating Category-Specific Opponent Factors \---")  
+        opponent\_factors \= {}  
+        pace\_map \= {}  
+        def fetch\_team\_defense\_splits(tid):  
+            \# Fetch ALL finalized games for the team this season with pagination  
+            all\_games \= \[\]  
+            page \= 1  
+            while True:  
+                params \= {"team\_ids\[\]": tid, "seasons\[\]": CURRENT\_SEASON, "per\_page": 100, "page": page, "status": "Final"}  
+                payload \= self.\_get\_full\_response("games", params)  
+                data \= payload.get("data", \[\])  
+                all\_games.extend(data)  
+                meta \= payload.get("meta", {})  
+                if page \>= meta.get("total\_pages", 1):  
+                    break  
+                page \+= 1  
+            if not all\_games:  
+                return None
+
+            \# Sort games by date descending (most recent first)  
+            all\_games \= sorted(all\_games, key=lambda x: x.get('date', '1900-01-01'), reverse=True)  
+            game\_ids \= \[g\['id'\] for g in all\_games\]  
+            last5\_game\_ids \= \[g\['id'\] for g in all\_games\[:5\]\] \# Last 5 games
+
+            if not game\_ids:  
+                return None
+
+            allowed\_stats\_season \= {k: \[\] for k in LEAGUE\_AVGS.keys()}  
+            allowed\_stats\_last5 \= {k: \[\] for k in LEAGUE\_AVGS.keys()}
+
+            all\_stats \= \[\]  
+            cursor \= None  
+            while True:  
+                s\_params \= {"game\_ids\[\]": game\_ids, "per\_page": 100}  
+                if cursor: s\_params\['cursor'\] \= cursor  
+                payload \= self.\_get\_full\_response("stats", s\_params)  
+                data \= payload.get("data", \[\])  
+                all\_stats.extend(data)  
+                meta \= payload.get("meta", {})  
+                cursor \= meta.get("next\_cursor")  
+                if not cursor or not data:  
+                    break
+
+            games\_map \= {}  
+            for row in all\_stats:  
+                gid \= row\['game'\]\['id'\]  
+                if gid not in games\_map: games\_map\[gid\] \= \[\]  
+                games\_map\[gid\].append(row)
+
+            pace\_season \= \[\]  
+            pace\_last5 \= \[\]  
+            for gid, rows in games\_map.items():  
+                game\_totals \= {k: 0.0 for k in LEAGUE\_AVGS.keys()}  
+                team\_totals \= {'fga': 0, 'fta': 0, 'oreb': 0, 'turnover': 0}  
+                for row in rows:  
+                    if row\['team'\]\['id'\] \!= tid:  
+                        for cat in LEAGUE\_AVGS.keys():  
+                            val \= row.get(cat, 0\)  
+                            if val: game\_totals\[cat\] \+= val  
+                    else:  
+                        team\_totals\['fga'\] \+= row.get('fga', 0\)  
+                        team\_totals\['fta'\] \+= row.get('fta', 0\)  
+                        team\_totals\['oreb'\] \+= row.get('oreb', 0\)  
+                        team\_totals\['turnover'\] \+= row.get('turnover', 0\)
+
+                team\_poss \= (team\_totals\['fga'\] \+ 0.4 \* team\_totals\['fta'\] \-  
+                             team\_totals\['oreb'\] \+ team\_totals\['turnover'\])  
+                pace\_season.append(team\_poss)  
+                if gid in last5\_game\_ids:  
+                    pace\_last5.append(team\_poss)
+
+                for cat in LEAGUE\_AVGS.keys():  
+                    allowed\_stats\_season\[cat\].append(game\_totals\[cat\])  
+                    if gid in last5\_game\_ids:  
+                        allowed\_stats\_last5\[cat\].append(game\_totals\[cat\])
+
+            \# Pace calculation  
+            if pace\_season:  
+                season\_pace \= np.mean(pace\_season)  
+            else:  
+                season\_pace \= LEAGUE\_AVG\_PACE
+
+            if pace\_last5 and len(pace\_last5) \>= 3:  
+                last5\_pace \= np.mean(pace\_last5)  
+            else:  
+                last5\_pace \= season\_pace
+
+            blended\_pace \= 0.5 \* season\_pace \+ 0.5 \* last5\_pace
+
+            team\_factors \= {}  
+            for cat in LEAGUE\_AVGS.keys():  
+                season\_vals \= allowed\_stats\_season\[cat\]  
+                last5\_vals \= allowed\_stats\_last5\[cat\]
+
+                if season\_vals:  
+                    season\_avg \= np.mean(season\_vals)  
+                else:  
+                    season\_avg \= LEAGUE\_AVGS.get(cat, 10.0)
+
+                if last5\_vals and len(last5\_vals) \>= 3: \# Min 3 for reliability  
+                    last5\_avg \= np.mean(last5\_vals)  
+                else:  
+                    last5\_avg \= season\_avg
+
+                blended\_avg \= 0.5 \* season\_avg \+ 0.5 \* last5\_avg  
+                league\_base \= LEAGUE\_AVGS.get(cat, 10.0)  
+                factor \= blended\_avg / league\_base  
+                team\_factors\[cat\] \= max(0.75, min(1.35, factor))
+
+            abbr \= ""  
+            for g in all\_games:  
+                if g\['home\_team'\]\['id'\] \== tid: abbr \= g\['home\_team'\]\['abbreviation'\]  
+                else: abbr \= g\['visitor\_team'\]\['abbreviation'\]  
+                break
+
+            return abbr, team\_factors, blended\_pace  
+        with concurrent.futures.ThreadPoolExecutor(max\_workers=MAX\_WORKERS) as executor:  
+            futures \= {executor.submit(fetch\_team\_defense\_splits, tid): tid for tid in team\_ids}  
+            for future in concurrent.futures.as\_completed(futures):  
+                try:  
+                    result \= future.result()  
+                    if result:  
+                        abbr, factors, pace \= result  
+                        opponent\_factors\[abbr\] \= factors  
+                        pace\_map\[abbr\] \= pace  
+                except Exception:  
+                    pass  
+        return opponent\_factors, pace\_map  
+    def get\_player\_stats(self, player\_id: int) \-\> pd.DataFrame:  
+        if player\_id in self.player\_logs\_cache:  
+            return self.player\_logs\_cache\[player\_id\]  
+        params \= {"player\_ids\[\]": player\_id, "seasons\[\]": CURRENT\_SEASON, "per\_page": 100}  
+        data \= self.\_get\_data("stats", params)  
+        df \= pd.DataFrame(data)  
+        if not df.empty:  
+            def clean\_min(m):  
+                if pd.isna(m):  
+                    return 0.0  
+                s \= str(m).strip()  
+                try:  
+                    return int(s.split(':')\[0\]) \+ int(s.split(':')\[1\])/60 if ':' in s else float(s)  
+                except:  
+                    return 0.0  
+            df\['minutes\_actual'\] \= df\['min'\].apply(clean\_min)  
+            df\['minutes\_trend'\] \= df\['minutes\_actual'\].clip(upper=48.0)  
+            for cat in STAT\_CATEGORIES:  
+                col \= cat  
+                if col not in df.columns:  
+                    df\[col\] \= 0.0  
+                else:  
+                    df\[col\] \= df\[col\].fillna(0)  
+                df\[f'ppm\_{cat}'\] \= np.where(df\['minutes\_actual'\] \> 0, df\[col\] / df\['minutes\_actual'\], 0\)  
+            if 'game' in df.columns:  
+                df\['date\_sort'\] \= df\['game'\].apply(lambda x: x.get('date') if x else '1900-01-01')  
+            df \= df.sort\_values('date\_sort', ascending=False)  
+        self.player\_logs\_cache\[player\_id\] \= df  
+        return df  
+    def calculate\_waterfall\_metric(self, df\_logs: pd.DataFrame, col\_name: str) \-\> float:  
+        if df\_logs.empty:  
+            return 0.0  
+        weighted\_sum \= 0.0  
+        total\_weight \= 0.0  
+        for config in WATERFALL\_CONFIG.values():  
+            subset \= df\_logs.head(config\['limit'\])  
+            if not subset.empty:  
+                val \= subset\[col\_name\].mean()  
+                if pd.notna(val):  
+                    weighted\_sum \+= val \* config\['weight'\]  
+                    total\_weight \+= config\['weight'\]  
+        return float(weighted\_sum / total\_weight) if total\_weight \> 0 else 0.0  
+    def calculate\_simple\_ma(self, df\_logs: pd.DataFrame, col\_name: str, games\_window: int \= 8\) \-\> float:  
+        if df\_logs.empty: return 0.0  
+        subset \= df\_logs.head(games\_window)  
+        if subset.empty: return 0.0  
+        val \= subset\[col\_name\].mean()  
+        return float(val) if pd.notna(val) else 0.0  
+    def calculate\_season\_baseline(self, df\_logs: pd.DataFrame, col\_name: str) \-\> float:  
+        if df\_logs.empty or len(df\_logs) \< MIN\_SAMPLE\_SIZE:  
+            print(f"\[DEBUG\] Sparse logs ({len(df\_logs)} games) for {col\_name} \- returning 0.0 baseline")  
+            return 0.0  
+        \# UPDATED: Filter to played games only (exclude DNPs/inactives with 0 minutes)  
+        df\_played \= df\_logs\[df\_logs\['minutes\_actual'\] \> 0\]  
+        if df\_played.empty:  
+            print(f"\[DEBUG\] No played games found for {col\_name} \- returning 0.0")  
+            return 0.0  
+        val \= df\_played\[col\_name\].mean()  
+        print(f"\[DEBUG\] Season baseline for {col\_name}: {val:.1f} from {len(df\_played)} played games")  
+        return float(val) if pd.notna(val) else 0.0  
+    def calculate\_raw\_demand(self, df\_logs: pd.DataFrame) \-\> float:  
+        if df\_logs.empty or len(df\_logs) \< MIN\_SAMPLE\_SIZE:  
+            return 0.0  
+        return self.calculate\_waterfall\_metric(df\_logs, 'minutes\_trend')  
+    def calculate\_base\_ppm(self, df\_logs: pd.DataFrame) \-\> Dict\[str, float\]:  
+        if df\_logs.empty:  
+            return {cat: 0.0 for cat in STAT\_CATEGORIES}  
+        return {cat: self.calculate\_waterfall\_metric(df\_logs, f'ppm\_{cat}') for cat in STAT\_CATEGORIES}  
+    def determine\_role(self, expected\_minutes: float) \-\> str:  
+        if expected\_minutes \>= 28.0:  
+            return "STARTER"  
+        elif expected\_minutes \>= 20.0:  
+            return "ROTATION"  
+        else:  
+            return "BENCH"  
+    def fetch\_player\_props\_v2(self, game\_ids: List\[int\]):  
+        print(f"\\n--- Fetching GOAT Tier Betting Lines (v2) for {len(game\_ids)} Games \---")  
+        self.betting\_lines\_cache \= {}  
+        prop\_map \= {  
+            'points': 'PTS',  
+            'rebounds': 'REB',  
+            'assists': 'AST',  
+            'threes': 'FG3M',  
+            'blocks': 'BLK',  
+            'steals': 'STL',  
+            'points\_rebounds\_assists': 'PRA',  
+            'points\_rebounds': 'PR',  
+            'points\_assists': 'PA',  
+            'rebounds\_assists': 'RA'  
+        }  
+        line\_caps \= {  
+            'PTS': 50, 'REB': 20, 'AST': 20,  
+            'FG3M': 10, 'BLK': 10, 'STL': 10,  
+            'PRA': 70, 'PR': 50, 'PA': 50, 'RA': 35  
+        }  
+        url \= "https://api.balldontlie.io/nba/v2/odds/player\_props"  
+        for gid in game\_ids:  
+            params \= {"game\_id": gid, "book": "draftkings"}  
+            payload \= self.\_get\_full\_response(url, params)  
+            data \= payload.get("data", \[\])  
+            count \= 0  
+            for prop in data:  
+                prop\_type \= prop.get('prop\_type')  
+                if prop\_type not in prop\_map:  
+                    continue  
+                line \= prop.get('line\_value')  
+                pid \= prop.get('player\_id')  
+                if line and pid:  
+                    stat\_key \= prop\_map\[prop\_type\]  
+                    line\_val \= float(line)  
+                    cap \= line\_caps.get(stat\_key, 100\)  
+                    if line\_val \> cap:  
+                        print(f" \[WARNING\] Invalid line for {stat\_key} ({line\_val} \> {cap}) in game {gid} \- skipping.")  
+                        continue  
+                    self.betting\_lines\_cache\[(pid, stat\_key)\] \= line\_val  
+                    count \+= 1  
+            print(f" \> Game {gid}: Cached {count} prop lines.")  
+\# \==========================================  
+\# LOGIC & TRANSFORMATION  
+\# \==========================================  
+def reshape\_forecast\_payload(df: pd.DataFrame, planner: NBAWorkforcePlanner) \-\> pd.DataFrame:  
+    records \= \[\]  
+    base\_stats\_map \= {  
+        'PTS': 'pts', 'AST': 'ast', 'REB': 'reb',  
+        'STL': 'stl', 'BLK': 'blk', 'FG3M': 'fg3m'  
+    }  
+    max\_line\_deltas \= {  
+        'PTS': 15,  
+        'REB': 8,  
+        'AST': 8,  
+        'FG3M': 5,  
+        'BLK': 5,  
+        'STL': 5,  
+        'PRA': 20,  
+        'PR': 18,  
+        'PA': 18,  
+        'RA': 12  
+    }  
+    RECENT\_WINDOW \= 3 \# UPDATED: Switched to last 3 games per your suggestion for tighter ranges  
+    for \_, row in df.iterrows():  
+        p\_name \= row\['player\_name'\]  
+        pid \= row\['player\_id'\]  
+        role \= row\['role'\]  
+        proj\_min \= row.get('normalized\_minutes', np.nan)  
+        min\_delta \= row.get('min\_delta', np.nan)  
+        last\_game\_delta \= row.get('last\_game\_delta', np.nan)  
+        player\_base\_qs \= {}  
+        player\_base\_stds \= {} \# Store stds for base stats  
+        logs \= planner.get\_player\_stats(pid)  
+        df\_played \= logs\[logs\['minutes\_actual'\] \> 0\] \# Full season played  
+        sparse\_data \= len(df\_played) \< MIN\_SAMPLE\_SIZE \# Flag for default  
+        \# 1\. Base Stats  
+        for display\_stat, internal\_code in base\_stats\_map.items():  
+            q\_vals \= \[row.get(f'{display\_stat}\_Q{i}', 0.0) for i in range(1, 5)\]  
+            total \= sum(q\_vals)  
+            player\_base\_qs\[display\_stat\] \= q\_vals  
+            \# Use std from recent games for tighter range  
+            recent\_logs \= df\_played.head(RECENT\_WINDOW)  
+            if len(recent\_logs) \>= 3: \# Require at least 3 for this tight window  
+                stat\_std \= recent\_logs\[internal\_code\].std()  
+            elif len(recent\_logs) \>= MIN\_SAMPLE\_SIZE:  
+                stat\_std \= recent\_logs\[internal\_code\].std()  
+            elif not df\_played.empty and not sparse\_data:  
+                stat\_std \= df\_played\[internal\_code\].std()  
+            else:  
+                stat\_std \= 2.0 \# Default buffer  
+            player\_base\_stds\[display\_stat\] \= stat\_std  
+            dk\_line \= planner.betting\_lines\_cache.get((pid, display\_stat), np.nan)  
+            applied\_factor \= row.get(f'factor\_{internal\_code}', 1.0)  
+            edge \= round(total \- dk\_line, 1\) if not np.isnan(dk\_line) else np.nan  
+            if not np.isnan(dk\_line):  
+                max\_delta \= max\_line\_deltas.get(display\_stat, 20\)  
+                if dk\_line \> total \+ max\_delta or dk\_line \> total \* 1.5:  
+                    print(f" \[WARNING\] Suspicious line for {p\_name} {display\_stat} ({dk\_line} vs forecast {total}) \- blanking.")  
+                    dk\_line \= np.nan  
+                    edge \= np.nan  
+            season\_avg\_total \= planner.calculate\_season\_baseline(logs, internal\_code)  
+            if display\_stat \== 'PTS':  
+                print(f"\[DEBUG\] For {p\_name} PTS: projected total \= {total}, season\_avg\_total \= {season\_avg\_total}")  
+            forecast\_vs\_season \= round(total \- season\_avg\_total, 1\) if season\_avg\_total \> 0 else np.nan  
+            waterfall\_ppm \= planner.calculate\_waterfall\_metric(logs, f'ppm\_{internal\_code}')  
+            ma\_ppm \= planner.calculate\_simple\_ma(logs, f'ppm\_{internal\_code}')  
+            waterfall\_total \= waterfall\_ppm \* proj\_min  
+            ma\_total \= ma\_ppm \* proj\_min  
+            recency\_vs\_season \= round(((waterfall\_total \- season\_avg\_total) \+ (ma\_total \- season\_avg\_total)) / 2, 1\) if season\_avg\_total \> 0 else np.nan  
+            if display\_stat \== 'PTS':  
+                print(f"\[DEBUG\] For {p\_name} PTS: Forecast\_vs\_Season\_Avg \= {forecast\_vs\_season}")  
+            story \= "Balanced projection – monitor lineup/news"  
+            if not np.isnan(dk\_line):  
+                if edge \>= 2.0 and min\_delta \>= 1.5 and forecast\_vs\_season \>= 2.0:  
+                    story \= "Strong over candidate – hot recency \+ expanded role \+ above season norm"  
+                elif edge \>= 1.0 and (min\_delta \>= 1.0 or forecast\_vs\_season \>= 1.5):  
+                    story \= "Solid over lean – favorable projection vs. line, supported by role/minutes"  
+                elif edge \>= 0.5 and forecast\_vs\_season \>= 1.0:  
+                    story \= "Moderate over value – projection above season average, slight edge"  
+                elif edge \<= \-1.0 and min\_delta \<= \-1.0:  
+                    story \= "Strong under candidate – reduced minutes \+ below season norm"  
+                elif edge \<= \-0.5 and forecast\_vs\_season \<= \-1.5:  
+                    story \= "Efficiency regression risk – below season despite minutes"  
+                elif abs(edge) \<= 0.5 and abs(min\_delta) \<= 1.0:  
+                    story \= "Neutral / fade the noise – close to season average, no strong trend"  
+                elif edge \>= 1.5 and forecast\_vs\_season \< 0:  
+                    story \= "Contrarian over – big edge but against season trend (risky)"  
+            \# Calculate range  
+            lower \= max(0, total \- stat\_std)  
+            upper \= total \+ stat\_std  
+            \# NEW: Pick6 Recommendation Logic  
+            pick6\_rec \= "Skip"  
+            if not np.isnan(dk\_line) and not np.isnan(applied\_factor) and applied\_factor \<= 1.05:  
+                mae\_threshold \= CATEGORY\_MAE.get(display\_stat, 5.0) \# Default medium buffer  
+                if abs(edge) \> mae\_threshold:  
+                    if total \> dk\_line:  
+                        pick6\_rec \= "More"  
+                    else:  
+                        pick6\_rec \= "Less"  
+            records.append({  
+                'player\_name': p\_name,  
+                'position': row\['position'\],  
+                'team': row\['team'\],  
+                'Opponent': row\['opponent'\],  
+                'Opponent\_Factor': round(applied\_factor, 3),  
+                'Stat': display\_stat,  
+                'Q1': q\_vals\[0\],  
+                'Q2': q\_vals\[1\],  
+                'Q3': q\_vals\[2\],  
+                'Q4': q\_vals\[3\],  
+                'Total': total,  
+                'Lower': lower,  
+                'Upper': upper,  
+                'Line': dk\_line,  
+                'Edge': edge,  
+                'Proj\_Min': round(proj\_min, 1),  
+                'Min\_Delta': round(min\_delta, 1),  
+                'Last\_Game\_Delta': round(last\_game\_delta, 1),  
+                'Forecast\_vs\_Season\_Avg': forecast\_vs\_season,  
+                'Recency\_vs\_Season': recency\_vs\_season,  
+                'Story': story,  
+                'Rotation\_Curve': role,  
+                'Pick6\_Rec': pick6\_rec \# NEW column  
+            })  
+        \# 2\. Composite Stats (PRA, etc)  
+        composites \= {  
+            'PRA': \['PTS', 'REB', 'AST'\],  
+            'PA': \['PTS', 'AST'\],  
+            'PR': \['PTS', 'REB'\],  
+            'RA': \['REB', 'AST'\]  
+        }  
+        for comp\_name, ingredients in composites.items():  
+            comp\_q\_vals \= \[0.0\] \* 4  
+            for ing in ingredients:  
+                ing\_vals \= player\_base\_qs.get(ing, \[0.0\]\*4)  
+                comp\_q\_vals \= \[sum(x) for x in zip(comp\_q\_vals, ing\_vals)\]  
+            total\_comp \= sum(comp\_q\_vals)  
+            dk\_line \= planner.betting\_lines\_cache.get((pid, comp\_name), np.nan)  
+            edge \= round(total\_comp \- dk\_line, 1\) if not np.isnan(dk\_line) else np.nan  
+            if not np.isnan(dk\_line):  
+                max\_delta \= max\_line\_deltas.get(comp\_name, 25\)  
+                if dk\_line \> total\_comp \+ max\_delta or dk\_line \> total\_comp \* 1.5:  
+                    print(f" \[WARNING\] Suspicious line for {p\_name} {comp\_name} ({dk\_line} vs forecast {total\_comp}) \- blanking.")  
+                    dk\_line \= np.nan  
+                    edge \= np.nan  
+            forecast\_vs\_season\_comp \= 0.0  
+            count\_ing \= 0  
+            for ing in ingredients:  
+                ing\_code \= {'PTS': 'pts', 'REB': 'reb', 'AST': 'ast'}.get(ing, 'pts')  
+                logs \= planner.get\_player\_stats(pid)  
+                season\_avg\_ing\_total \= planner.calculate\_season\_baseline(logs, ing\_code)  
+                ing\_total \= player\_base\_qs\[ing\]\[0\] \+ player\_base\_qs\[ing\]\[1\] \+ player\_base\_qs\[ing\]\[2\] \+ player\_base\_qs\[ing\]\[3\]  
+                forecast\_vs\_season\_comp \+= (ing\_total \- season\_avg\_ing\_total)  
+                count\_ing \+= 1  
+            forecast\_vs\_season \= round(forecast\_vs\_season\_comp, 1\) if count\_ing \> 0 else np.nan  
+            recency\_vs\_season\_comp \= 0.0  
+            for ing in ingredients:  
+                ing\_code \= {'PTS': 'pts', 'REB': 'reb', 'AST': 'ast'}.get(ing, 'pts')  
+                waterfall\_ppm \= planner.calculate\_waterfall\_metric(logs, f'ppm\_{ing\_code}')  
+                ma\_ppm \= planner.calculate\_simple\_ma(logs, f'ppm\_{ing\_code}')  
+                waterfall\_ing\_total \= waterfall\_ppm \* proj\_min  
+                ma\_ing\_total \= ma\_ppm \* proj\_min  
+                recency\_vs\_season\_comp \+= ((waterfall\_ing\_total \- season\_avg\_ing\_total) \+ (ma\_ing\_total \- season\_avg\_ing\_total)) / 2  
+            recency\_vs\_season \= round(recency\_vs\_season\_comp, 1\) if count\_ing \> 0 else np.nan  
+            \# Approximate std for composite (sum of recent component stds)  
+            comp\_std \= sum(player\_base\_stds.get(ing, 0.0) for ing in ingredients)  
+            if sparse\_data:  
+                comp\_std \= 2.0 \* len(ingredients) \# Scaled default  
+            lower \= max(0, total\_comp \- comp\_std)  
+            upper \= total\_comp \+ comp\_std  
+            story \= "Balanced projection – monitor lineup/news"  
+            if not np.isnan(dk\_line):  
+                if edge \>= 2.0 and min\_delta \>= 1.5 and forecast\_vs\_season \>= 2.0:  
+                    story \= "Strong over candidate – hot recency \+ expanded role \+ above season norm"  
+                elif edge \>= 1.0 and (min\_delta \>= 1.0 or forecast\_vs\_season \>= 1.5):  
+                    story \= "Solid over lean – favorable projection vs. line, supported by role/minutes"  
+                elif edge \>= 0.5 and forecast\_vs\_season \>= 1.0:  
+                    story \= "Moderate over value – projection above season average, slight edge"  
+                elif edge \<= \-1.0 and min\_delta \<= \-1.0:  
+                    story \= "Strong under candidate – reduced minutes \+ below season norm"  
+                elif edge \<= \-0.5 and forecast\_vs\_season \<= \-1.5:  
+                    story \= "Efficiency regression risk – below season despite minutes"  
+                elif abs(edge) \<= 0.5 and abs(min\_delta) \<= 1.0:  
+                    story \= "Neutral / fade the noise – close to season average, no strong trend"  
+                elif edge \>= 1.5 and forecast\_vs\_season \< 0:  
+                    story \= "Contrarian over – big edge but against season trend (risky)"  
+            \# NEW: Pick6 Recommendation Logic (for composites, Opponent\_Factor is NaN, so skip)  
+            pick6\_rec \= "Skip"  
+            if not np.isnan(dk\_line) and not np.isnan(applied\_factor) and applied\_factor \<= 1.05:  
+                mae\_threshold \= CATEGORY\_MAE.get(comp\_name, 5.0) \# Default medium buffer  
+                if abs(edge) \> mae\_threshold:  
+                    if total\_comp \> dk\_line:  
+                        pick6\_rec \= "More"  
+                    else:  
+                        pick6\_rec \= "Less"  
+            records.append({  
+                'player\_name': p\_name,  
+                'position': row\['position'\],  
+                'team': row\['team'\],  
+                'Opponent': row\['opponent'\],  
+                'Opponent\_Factor': np.nan,  
+                'Stat': comp\_name,  
+                'Q1': comp\_q\_vals\[0\],  
+                'Q2': comp\_q\_vals\[1\],  
+                'Q3': comp\_q\_vals\[2\],  
+                'Q4': comp\_q\_vals\[3\],  
+                'Total': total\_comp,  
+                'Lower': lower,  
+                'Upper': upper,  
+                'Line': dk\_line,  
+                'Edge': edge,  
+                'Proj\_Min': round(proj\_min, 1),  
+                'Min\_Delta': round(min\_delta, 1),  
+                'Last\_Game\_Delta': round(last\_game\_delta, 1),  
+                'Forecast\_vs\_Season\_Avg': forecast\_vs\_season,  
+                'Recency\_vs\_Season': recency\_vs\_season,  
+                'Story': story,  
+                'Rotation\_Curve': role,  
+                'Pick6\_Rec': pick6\_rec \# NEW column  
+            })  
+        \# 3\. DKFP  
+        dkfp\_q\_vals \= \[0.0\] \* 4  
+        for i in range(4):  
+            q\_score \= 0.0  
+            q\_score \+= player\_base\_qs\['PTS'\]\[i\] \* 1.0  
+            q\_score \+= player\_base\_qs\['FG3M'\]\[i\] \* 0.5  
+            q\_score \+= player\_base\_qs\['REB'\]\[i\] \* 1.25  
+            q\_score \+= player\_base\_qs\['AST'\]\[i\] \* 1.5  
+            q\_score \+= player\_base\_qs\['STL'\]\[i\] \* 2.0  
+            q\_score \+= player\_base\_qs\['BLK'\]\[i\] \* 2.0  
+            dkfp\_q\_vals\[i\] \= q\_score  
+        total\_dkfp \= sum(dkfp\_q\_vals)  
+        \# Approximate std for DKFP (weighted sum of recent base stds)  
+        dkfp\_std \= (  
+            player\_base\_stds\['PTS'\] \* 1.0 \+  
+            player\_base\_stds\['FG3M'\] \* 0.5 \+  
+            player\_base\_stds\['REB'\] \* 1.25 \+  
+            player\_base\_stds\['AST'\] \* 1.5 \+  
+            player\_base\_stds\['STL'\] \* 2.0 \+  
+            player\_base\_stds\['BLK'\] \* 2.0  
+        )  
+        if sparse\_data:  
+            dkfp\_std \= 2.0 \* 6 \# Default for 6 components  
+        lower \= max(0, total\_dkfp \- dkfp\_std)  
+        upper \= total\_dkfp \+ dkfp\_std  
+        \# NEW: Pick6 Recommendation Logic (no line, so always Skip)  
+        pick6\_rec \= "Skip"  
+        records.append({  
+            'player\_name': p\_name,  
+            'position': row\['position'\],  
+            'team': row\['team'\],  
+            'Opponent': row\['opponent'\],  
+            'Opponent\_Factor': np.nan,  
+            'Stat': 'DKFP',  
+            'Q1': dkfp\_q\_vals\[0\],  
+            'Q2': dkfp\_q\_vals\[1\],  
+            'Q3': dkfp\_q\_vals\[2\],  
+            'Q4': dkfp\_q\_vals\[3\],  
+            'Total': total\_dkfp,  
+            'Lower': lower,  
+            'Upper': upper,  
+            'Line': np.nan,  
+            'Edge': np.nan,  
+            'Proj\_Min': round(proj\_min, 1),  
+            'Min\_Delta': round(min\_delta, 1),  
+            'Last\_Game\_Delta': round(last\_game\_delta, 1),  
+            'Forecast\_vs\_Season\_Avg': np.nan,  
+            'Recency\_vs\_Season': np.nan,  
+            'Story': "Fantasy scoring projection – no DK line comparison",  
+            'Rotation\_Curve': role,  
+            'Pick6\_Rec': pick6\_rec \# NEW column  
+        })  
+    long\_df \= pd.DataFrame(records)  
+    cols\_to\_round \= \['Q1', 'Q2', 'Q3', 'Q4', 'Total', 'Lower', 'Upper', 'Edge', 'Proj\_Min', 'Min\_Delta', 'Last\_Game\_Delta', 'Forecast\_vs\_Season\_Avg', 'Recency\_vs\_Season'\]  
+    long\_df\[cols\_to\_round\] \= long\_df\[cols\_to\_round\].round(1)
+
+    long\_df\['Total'\] \= long\_df\[\['Q1', 'Q2', 'Q3', 'Q4'\]\].sum(axis=1)  
+    \# NEW: Sort by descending |Edge| for "Top Picks" view in Sheets  
+    long\_df\['Abs\_Edge'\] \= long\_df\['Edge'\].abs()  
+    long\_df \= long\_df.sort\_values('Abs\_Edge', ascending=False).drop(columns=\['Abs\_Edge'\])
+
+    return long\_df  
+def normalize\_team\_capacity(team\_roster\_df: pd.DataFrame) \-\> pd.DataFrame:  
+    total\_forecasted\_minutes \= team\_roster\_df\['raw\_minutes\_forecast'\].sum()  
+    print(f" \[CHECK\] Raw Team Demand: {total\_forecasted\_minutes:.1f} mins")  
+    if total\_forecasted\_minutes \< MIN\_TEAM\_PROJECTION:  
+        print(f" \[ALERT\] Low data capture (\<{MIN\_TEAM\_PROJECTION}). Skipping normalization.")  
+        team\_roster\_df\['normalized\_minutes'\] \= team\_roster\_df\['raw\_minutes\_forecast'\]  
+    else:  
+        utilization\_factor \= TEAM\_CAPACITY\_MINUTES / total\_forecasted\_minutes  
+        print(f" \[NOTE\] Adjusting by Factor: {utilization\_factor:.3f}")  
+        team\_roster\_df\['normalized\_minutes'\] \= team\_roster\_df\['raw\_minutes\_forecast'\] \* utilization\_factor  
+    team\_roster\_df\['min\_delta'\] \= team\_roster\_df\['normalized\_minutes'\] \- team\_roster\_df\['last\_8\_min\_avg'\]  
+    team\_roster\_df\['last\_game\_delta'\] \= team\_roster\_df\['normalized\_minutes'\] \- team\_roster\_df\['last\_game\_min'\]  
+    return team\_roster\_df  
+def apply\_interval\_distribution(team\_roster\_df: pd.DataFrame) \-\> pd.DataFrame:  
+    for cat in STAT\_CATEGORIES:  
+        display\_name \= "FG3M" if cat \== "fg3m" else cat.upper()  
+        q\_cols \= \[f'{display\_name}\_Q{i}' for i in range(1, 5)\]  
+        for c in q\_cols:  
+            team\_roster\_df\[c\] \= 0.0  
+    for idx, row in team\_roster\_df.iterrows():  
+        role \= row\['role'\]  
+        curve \= ROTATION\_CURVES.get(role, ROTATION\_CURVES\["BENCH"\])
+
+        for cat in STAT\_CATEGORIES:  
+            display\_name \= "FG3M" if cat \== "fg3m" else cat.upper()  
+            q\_cols \= \[f'{display\_name}\_Q{i}' for i in range(1, 5)\]
+
+            total\_proj \= row\[f'fc\_{cat}'\]
+
+            team\_roster\_df.at\[idx, q\_cols\[0\]\] \= total\_proj \* curve\[0\]  
+            team\_roster\_df.at\[idx, q\_cols\[1\]\] \= total\_proj \* curve\[1\]  
+            team\_roster\_df.at\[idx, q\_cols\[2\]\] \= total\_proj \* curve\[2\]  
+            team\_roster\_df.at\[idx, q\_cols\[3\]\] \= total\_proj \* curve\[3\]  
+    return team\_roster\_df  
+def process\_player(planner, player, team\_data, opponent):  
+    pid \= player\['id'\]  
+    p\_name \= f"{player\['first\_name'\]} {player\['last\_name'\]}"
+
+    logs \= planner.get\_player\_stats(pid)
+
+    raw\_mins \= planner.calculate\_raw\_demand(logs)
+
+    if raw\_mins \< 5.0:  
+        return None
+
+    last\_8\_min\_avg \= planner.calculate\_simple\_ma(logs, 'minutes\_actual', games\_window=8)
+
+    last\_game\_min \= logs.head(1)\['minutes\_actual'\].item() if not logs.empty else 0.0
+
+    waterfall\_ppm \= planner.calculate\_base\_ppm(logs)
+
+    ma\_ppm \= {}  
+    for cat in STAT\_CATEGORIES:  
+        ma\_ppm\[cat\] \= planner.calculate\_simple\_ma(logs, f'ppm\_{cat}', games\_window=8)
+
+    season\_ppm \= {}  
+    for cat in STAT\_CATEGORIES:  
+        season\_ppm\[cat\] \= planner.calculate\_season\_baseline(logs, f'ppm\_{cat}')
+
+    w\_weight \= 0.60  
+    m\_weight \= 0.20  
+    s\_weight \= 0.20
+
+    blended\_ppm \= {}
+
+    for cat in STAT\_CATEGORIES:  
+        w\_val \= waterfall\_ppm.get(cat, 0.0)  
+        m\_val \= ma\_ppm.get(cat, 0.0)  
+        s\_val \= season\_ppm.get(cat, 0.0)
+
+        blended\_ppm\[cat\] \= (w\_val \* w\_weight) \+ (m\_val \* m\_weight) \+ (s\_val \* s\_weight)  
+    role \= planner.determine\_role(raw\_mins)
+
+    player\_data \= {  
+        "player\_id": pid,  
+        "player\_name": p\_name,  
+        "position": player.get("position", "N/A"), \# Extract position from player dict  
+        "team": team\_data\['abbreviation'\],  
+        "opponent": opponent,  
+        "role": role,  
+        "raw\_minutes\_forecast": raw\_mins,  
+        "last\_8\_min\_avg": last\_8\_min\_avg,  
+        "last\_game\_min": last\_game\_min,  
+    }
+
+    for cat, val in blended\_ppm.items():  
+        player\_data\[f"ppm\_{cat}"\] \= val
+
+    return player\_data  
+def run\_workforce\_forecast() \-\> pd.DataFrame:  
+    planner \= NBAWorkforcePlanner(API\_KEY)  
+    global\_start \= time.time()  
+    print(f"Using season: {CURRENT\_SEASON}")  
+    schedule\_df \= planner.get\_games\_today()  
+    if schedule\_df.empty:  
+        print("No games scheduled.")  
+        return pd.DataFrame()  
+    game\_ids \= schedule\_df\['id'\].tolist()
+
+    planner.fetch\_player\_props\_v2(game\_ids)  
+    team\_ids\_in\_play \= set(schedule\_df\['home\_team'\].apply(lambda x: x\['id'\]).tolist() \+  
+                           schedule\_df\['visitor\_team'\].apply(lambda x: x\['id'\]).tolist())
+
+    dynamic\_factors\_map, pace\_map \= planner.generate\_dynamic\_opponent\_factors(list(team\_ids\_in\_play))  
+    all\_forecasts \= \[\]  
+    for idx, game in schedule\_df.iterrows():  
+        home\_team \= game\['home\_team'\]  
+        visitor\_team \= game\['visitor\_team'\]  
+        print(f"\\n=== MATCHUP: {visitor\_team\['abbreviation'\]} @ {home\_team\['abbreviation'\]} \===")  
+        for team\_data, \_, opponent in \[(home\_team, True, visitor\_team\['abbreviation'\]),  
+                                       (visitor\_team, False, home\_team\['abbreviation'\])\]:  
+            print(f"\> Processing {team\_data\['abbreviation'\]}")  
+            roster \= planner.get\_active\_rotation(team\_data\['id'\])  
+            if not roster:  
+                print(f" \[SKIP\] No active rotation found for {team\_data\['abbreviation'\]}")  
+                continue  
+            team\_forecasts \= \[\]  
+            with concurrent.futures.ThreadPoolExecutor(max\_workers=MAX\_WORKERS) as executor:  
+                futures \= {executor.submit(process\_player, planner, player, team\_data, opponent): player for player in roster}  
+                for future in concurrent.futures.as\_completed(futures):  
+                    result \= future.result()  
+                    if result:  
+                        team\_forecasts.append(result)  
+            print(f" \[DEBUG\] Processed players: {len(team\_forecasts)}")  
+            if not team\_forecasts:  
+                continue  
+            team\_df \= pd.DataFrame(team\_forecasts)  
+            team\_df \= normalize\_team\_capacity(team\_df)
+
+            opp\_factors \= dynamic\_factors\_map.get(opponent, {})  
+            opp\_pace \= pace\_map.get(opponent, LEAGUE\_AVG\_PACE)  
+            pace\_scalar \= opp\_pace / LEAGUE\_AVG\_PACE  
+            for cat in STAT\_CATEGORIES:  
+                factor \= opp\_factors.get(cat, 1.0)  
+                team\_df\[f'factor\_{cat}'\] \= factor  
+                team\_df\[f'fc\_{cat}'\] \= team\_df\['normalized\_minutes'\] \* team\_df\[f'ppm\_{cat}'\] \* factor \* pace\_scalar  
+            team\_df \= apply\_interval\_distribution(team\_df)  
+            all\_forecasts.append(team\_df)  
+    elapsed\_total \= time.time() \- global\_start  
+    print(f"\\nEXECUTION COMPLETE: {elapsed\_total:.2f}s | Total requests: {planner.request\_count}")  
+    if all\_forecasts:  
+        raw\_final\_df \= pd.concat(all\_forecasts, ignore\_index=True)  
+        formatted\_df \= reshape\_forecast\_payload(raw\_final\_df, planner)  
+        return formatted\_df  
+    return pd.DataFrame()  
+\# Run the forecast directly (no if \_\_name\_\_ for Colab)  
+forecast\_df \= run\_workforce\_forecast()  
+if not forecast\_df.empty:  
+    auth.authenticate\_user()  
+    creds, \_ \= default()  
+    gc \= gspread.authorize(creds)  
+    sh \= gc.open\_by\_url('https://docs.google.com/spreadsheets/d/18Rt1wDnERX8me56mBdVZIhW8fSkMw-8lQHFocqVArdM/edit?gid=0\#gid=0')  
+    worksheet \= sh.worksheet('Sheet1')  
+    worksheet.clear()  
+    set\_with\_dataframe(worksheet, forecast\_df)  
+    print("Forecast exported to Google Sheet successfully.")  
+else:  
+    print("No forecast data to export.")  
