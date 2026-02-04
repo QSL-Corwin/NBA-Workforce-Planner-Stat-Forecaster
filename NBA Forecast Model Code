@@ -856,7 +856,7 @@ if not forecast\_df.empty:
     auth.authenticate\_user()  
     creds, \_ \= default()  
     gc \= gspread.authorize(creds)  
-    sh \= gc.open\_by\_url('https://docs.google.com/spreadsheets/d/18Rt1wDnERX8me56mBdVZIhW8fSkMw-8lQHFocqVArdM/edit?gid=0\#gid=0')  
+    sh \= gc.open\_by\_url('https://docs.google.com/spreadsheets')  
     worksheet \= sh.worksheet('Sheet1')  
     worksheet.clear()  
     set\_with\_dataframe(worksheet, forecast\_df)  
